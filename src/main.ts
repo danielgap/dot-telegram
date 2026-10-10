@@ -16,8 +16,11 @@ function main(): void {
 		process.exit(1);
 	}
 
+	process.on("unhandledRejection", (error) => log(`unexpected error: ${(error as Error)?.message ?? String(error)}`));
+
 	const bot = new Bot(config.botToken);
 	let bridge: Bridge | undefined;
+	let failed = false;
 	const daemon = new DaemonClient({
 		url: config.daemonUrl,
 		tokenFile: config.tokenFile,
@@ -27,6 +30,7 @@ function main(): void {
 			if (!connected) void bridge?.connectionLost();
 		},
 		onFatal: (reason) => {
+			failed = true;
 			log(reason);
 			void bot.stop().finally(() => process.exit(1));
 		},
@@ -41,6 +45,8 @@ function main(): void {
 	process.once("SIGTERM", shutdown);
 
 	daemon.start();
+	// A missing key file fails at once; do not start polling Telegram for a bridge that cannot work.
+	if (failed) return;
 	void bot
 		.start({
 			allowed_updates: ["message", "callback_query", "stopped_message_generation"],

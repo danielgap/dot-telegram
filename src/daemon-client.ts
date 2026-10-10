@@ -28,6 +28,8 @@ export class DaemonClient {
 	private timer: NodeJS.Timeout | undefined;
 	private attempt = 0;
 	private stopped = false;
+	/** The daemon answered at least once, so a missing key file is a restart, not a wrong setup. */
+	private answered = false;
 
 	constructor(options: DaemonClientOptions) {
 		this.options = options;
@@ -62,14 +64,14 @@ export class DaemonClient {
 		try {
 			token = readFileSync(this.options.tokenFile, "utf8").trim();
 		} catch {
-			this.fatal(`Cannot read the Gentle Dot access key at ${this.options.tokenFile}. Is Gentle Dot installed?`);
+			if (this.answered) this.retry();
+			else this.fatal(`Cannot read the Gentle Dot access key at ${this.options.tokenFile}. Is Gentle Dot installed?`);
 			return;
 		}
 		const socket = new WebSocket(this.options.url);
 		this.socket = socket;
 		socket.on("open", () => {
 			socket.send(JSON.stringify({ type: "hello", token, protocol: PROTOCOL_VERSION }));
-			this.attempt = 0;
 			this.options.onConnection?.(true);
 		});
 		socket.on("message", (data) => {
@@ -80,6 +82,9 @@ export class DaemonClient {
 				return;
 			}
 			if (typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string") {
+				// Only an answer proves the hello was accepted; until then the delay keeps growing.
+				this.attempt = 0;
+				this.answered = true;
 				this.options.onMessage(value as ServerMessage);
 			}
 		});

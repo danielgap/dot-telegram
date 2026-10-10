@@ -33,14 +33,22 @@ export interface BridgeOptions {
 	download?(filePath: string): Promise<Buffer>;
 }
 
-/** Downloads from the Bot API file endpoint; errors never carry the address, which holds the token. */
-export function telegramDownloader(botToken: string): (filePath: string) => Promise<Buffer> {
+/**
+ * Downloads from the Bot API file endpoint, giving up after `timeoutMs` (updates are handled one at a
+ * time, so a hung download would hold up /stop). Errors never carry the address, which holds the token.
+ */
+export function telegramDownloader(
+	botToken: string,
+	options: { timeoutMs?: number; fetch?: typeof fetch } = {},
+): (filePath: string) => Promise<Buffer> {
+	const get = options.fetch ?? fetch;
 	return async (filePath) => {
+		const signal = AbortSignal.timeout(options.timeoutMs ?? 30_000);
 		let response: Response;
 		try {
-			response = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+			response = await get(`https://api.telegram.org/file/bot${botToken}/${filePath}`, { signal });
 		} catch {
-			throw new Error("network error");
+			throw new Error(signal.aborted ? "timed out" : "network error");
 		}
 		if (!response.ok) throw new Error(`HTTP ${response.status}`);
 		return Buffer.from(await response.arrayBuffer());
@@ -69,6 +77,12 @@ interface PendingAsk {
 	messageId?: number;
 }
 
+/** `head` then `suffix` in one Telegram message, shortening `head` with "…" when needed. */
+function fitMessage(head: string, suffix: string): string {
+	if (head.length + suffix.length <= TELEGRAM_TEXT_LIMIT) return head + suffix;
+	return `${head.slice(0, TELEGRAM_TEXT_LIMIT - suffix.length - 1)}…${suffix}`;
+}
+
 interface Turn {
 	chatId: number;
 	draftId: number;
@@ -90,6 +104,7 @@ export class Bridge {
 	private nextAskKey = 1;
 	/** The input or editor ask the next text message answers. */
 	private awaitingInput: number | undefined;
+	private agentState: AgentState = "idle";
 	/** The daemon can transcribe voice notes (it has an OpenAI API key). */
 	private canTranscribe = false;
 	/** Transcriptions this bridge asked for, by request id, with the chat they came from. */
@@ -118,9 +133,20 @@ export class Bridge {
 
 	/** Handles one daemon message; resolves once its Telegram calls are done. */
 	async handleDaemon(message: ServerMessage): Promise<void> {
+		try {
+			await this.dispatch(message);
+		} catch (error) {
+			this.options.log(`ignored a daemon message (${message.type}): ${(error as Error).message}`);
+		}
+	}
+
+	private async dispatch(message: ServerMessage): Promise<void> {
 		const turn = this.turn;
 		switch (message.type) {
 			case "ready":
+				this.agentState = message.agentState;
+				this.canTranscribe = message.voice?.transcribe ?? false;
+				return;
 			case "auth_providers":
 				if (message.voice) this.canTranscribe = message.voice.transcribe;
 				return;
@@ -142,6 +168,7 @@ export class Bridge {
 				return;
 			}
 			case "agent_state":
+				this.agentState = message.state;
 				if (!turn) return;
 				if (BUSY_STATES.includes(message.state)) {
 					turn.sawBusy = true;
@@ -157,6 +184,10 @@ export class Bridge {
 			case "message_done": {
 				if (!turn) return;
 				const text = message.error ?? message.text;
+				if (text.trim() === "") {
+					if (message.stopped) await this.reply(turn.chatId, "Stopped.");
+					return;
+				}
 				for (const chunk of splitMessage(text)) await this.reply(turn.chatId, chunk);
 				return;
 			}
@@ -164,7 +195,10 @@ export class Bridge {
 				if (turn && message.level !== "info") await this.reply(turn.chatId, `⚠️ ${message.message}`);
 				return;
 			case "error":
-				if (turn) await this.reply(turn.chatId, `⚠️ ${message.message}`);
+				if (!turn) return;
+				// While the assistant is not running, an error means the message never started a run.
+				if (!BUSY_STATES.includes(this.agentState)) this.endTurn();
+				await this.reply(turn.chatId, `⚠️ ${message.message}`);
 				return;
 			case "ask":
 				await this.showAsk(message.ask);
@@ -179,6 +213,12 @@ export class Bridge {
 
 	/** The daemon connection dropped: a Telegram turn cannot finish, so it ends here. */
 	async connectionLost(): Promise<void> {
+		// The daemon never resolves what it lost; a restarted daemon sends its open questions again.
+		const stale = [...this.asks.values()];
+		this.asks.clear();
+		this.awaitingInput = undefined;
+		this.transcriptions.clear();
+		for (const pending of stale) await this.removeButtons(pending);
 		const turn = this.turn;
 		if (!turn) return;
 		this.endTurn();
@@ -197,7 +237,7 @@ export class Bridge {
 	}
 
 	private async onText(chatId: number, text: string): Promise<void> {
-		if (text.startsWith("/")) {
+		if (text.trimStart().startsWith("/")) {
 			await this.reply(chatId, "That command is not supported here.");
 			return;
 		}
@@ -250,16 +290,18 @@ export class Bridge {
 	}
 
 	private async showAsk(ask: Ask): Promise<void> {
+		if (typeof ask?.requestId !== "string" || typeof ask.title !== "string") throw new Error("malformed ask");
+		for (const pending of this.asks.values()) if (pending.ask.requestId === ask.requestId) return;
 		const chatId = this.turn?.chatId ?? this.chatId;
 		const head = ask.message ? `${ask.title}\n\n${ask.message}` : ask.title;
 		if (ask.method === "app") {
-			await this.reply(chatId, `${head}\n\nApprove this in the Gentle Dot desktop app.`);
+			await this.reply(chatId, fitMessage(head, "\n\nApprove this in the Gentle Dot desktop app."));
 			return;
 		}
 		if (ask.method === "pin") {
 			await this.reply(
 				chatId,
-				`${head}\n\nPIN approvals are not supported from Telegram. Use the Gentle Dot web page.`,
+				fitMessage(head, "\n\nPIN approvals are not supported from Telegram. Use the Gentle Dot web page."),
 			);
 			return;
 		}
@@ -269,7 +311,7 @@ export class Bridge {
 		if (ask.method === "input" || ask.method === "editor") {
 			if (this.awaitingInput !== undefined) this.asks.delete(this.awaitingInput);
 			this.awaitingInput = key;
-			await this.reply(chatId, `${head}\n\nReply with your answer, or /cancel.`);
+			await this.reply(chatId, fitMessage(head, "\n\nReply with your answer, or /cancel."));
 			return;
 		}
 		const keyboard = new InlineKeyboard();
@@ -280,7 +322,7 @@ export class Bridge {
 			keyboard.text("Cancel", `a:${key}:c`);
 		}
 		try {
-			const sent = await this.bot.api.sendMessage(chatId, head, { reply_markup: keyboard });
+			const sent = await this.bot.api.sendMessage(chatId, fitMessage(head, ""), { reply_markup: keyboard });
 			pending.messageId = sent.message_id;
 		} catch (error) {
 			this.options.log(`showing a question failed: ${(error as Error).message}`);
@@ -368,7 +410,8 @@ export class Bridge {
 			chatId,
 			draftId: 1 + Math.floor(Math.random() * 2_000_000_000),
 			draftText: "",
-			sawBusy: false,
+			// Sent into a run already going (a steer): that run's idle ends this turn too.
+			sawBusy: BUSY_STATES.includes(this.agentState),
 			refresh: setInterval(() => void this.draft(turn), this.options.draftRefreshMs ?? DRAFT_REFRESH_MS),
 		};
 		this.turn = turn;

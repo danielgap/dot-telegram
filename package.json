@@ -9,6 +9,7 @@
 	},
 	"scripts": {
 		"start": "node src/main.ts",
+		"start:env": "node --env-file=.env src/main.ts",
 		"test": "vitest run",
 		"typecheck": "tsc --noEmit"
 	},

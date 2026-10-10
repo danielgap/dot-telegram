@@ -33,12 +33,24 @@ You need Node.js 22.18 or later and Gentle Dot running on the same machine (or r
 2. **Find your user id.** Send any message to [@userinfobot](https://t.me/userinfobot); it answers with
    your numeric id.
 3. **Open a chat with your bot** and press Start, so it is allowed to write to you.
-4. **Install and run:**
+4. **Configure it** in a `.env` file readable only by you, so the token stays out of your shell history:
+
+   ```sh
+   cat > .env <<'ENV'
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   DOT_TELEGRAM_ALLOWED_USERS=123456789
+   ENV
+   chmod 600 .env
+   ```
+
+5. **Install and run:**
 
    ```sh
    npm install
-   TELEGRAM_BOT_TOKEN=123456:ABC... DOT_TELEGRAM_ALLOWED_USERS=123456789 npm start
+   npm run start:env   # node --env-file=.env src/main.ts
    ```
+
+   `npm start` reads the same variables from the environment instead.
 
 ### Configuration
 

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -53,7 +53,7 @@ afterEach(async () => {
 	cleanup = [];
 });
 
-async function setup(options: { retryMs?: number } = {}) {
+async function setup(options: { delay?: (attempt: number) => number } = {}) {
 	const daemon = await fakeDaemon();
 	const file = tokenFile("key-1");
 	const received: ServerMessage[] = [];
@@ -63,7 +63,7 @@ async function setup(options: { retryMs?: number } = {}) {
 		tokenFile: file,
 		onMessage: (message) => received.push(message),
 		onFatal: (reason) => fatal.push(reason),
-		delay: () => options.retryMs ?? 10,
+		delay: options.delay ?? (() => 10),
 	});
 	cleanup.push(() => daemon.close(), () => client.stop());
 	return { daemon, file, received, fatal, client };
@@ -169,6 +169,74 @@ describe("DaemonClient", () => {
 		cleanup.push(() => client.stop());
 		client.start();
 		await until(() => attempts >= 3);
+	});
+});
+
+describe("DaemonClient backoff and key file", () => {
+	it("keeps growing the delay while the daemon accepts and drops the connection without answering", async () => {
+		const daemon = await fakeDaemon();
+		const attempts: number[] = [];
+		const client = new DaemonClient({
+			url: daemon.url,
+			tokenFile: tokenFile("key"),
+			onMessage: () => {},
+			onFatal: () => {},
+			delay: (attempt) => {
+				attempts.push(attempt);
+				return 5;
+			},
+		});
+		cleanup.push(() => daemon.close(), () => client.stop());
+		const dropAll = async () => {
+			for (;;) {
+				const ws = await daemon.nextSocket();
+				ws.close(1011, "busy");
+			}
+		};
+		void dropAll();
+		client.start();
+		await until(() => attempts.length >= 3);
+		expect(attempts.slice(0, 3)).toEqual([1, 2, 3]);
+	});
+
+	it("starts the delay over once the daemon answered", async () => {
+		const attempts: number[] = [];
+		const { daemon, client } = await setup({
+			delay: (attempt) => {
+				attempts.push(attempt);
+				return 5;
+			},
+		});
+		let next = daemon.nextSocket();
+		client.start();
+		let ws = await next;
+		next = daemon.nextSocket();
+		ws.close(1011, "busy");
+		ws = await next;
+		ws.send(JSON.stringify({ type: "ready", agentState: "idle", seq: 1 }));
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		next = daemon.nextSocket();
+		ws.close(1011, "busy");
+		await next;
+		expect(attempts).toEqual([1, 1]);
+	});
+
+	it("keeps retrying when the key file is briefly missing after a connection", async () => {
+		const { daemon, client, file, fatal } = await setup();
+		let next = daemon.nextSocket();
+		client.start();
+		const first = await next;
+		first.send(JSON.stringify({ type: "ready", agentState: "idle", seq: 1 }));
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		rmSync(file);
+		next = daemon.nextSocket();
+		first.close(1001, "restarting");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		writeFileSync(file, "key-3\n");
+		await next;
+		await until(() => daemon.frames.length === 2);
+		expect(daemon.frames[1]).toEqual({ type: "hello", token: "key-3", protocol: 1 });
+		expect(fatal).toEqual([]);
 	});
 });
 

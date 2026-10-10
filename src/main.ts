@@ -18,12 +18,14 @@ function main(): void {
 
 	process.on("unhandledRejection", (error) => log(`unexpected error: ${(error as Error)?.message ?? String(error)}`));
 
-	const bot = new Bot(config.botToken);
+	// Bot API calls give up after 60 s (long polling waits 30 s), so one stuck call cannot hold every update.
+	const bot = new Bot(config.botToken, { client: { timeoutSeconds: 60 } });
 	let bridge: Bridge | undefined;
 	let failed = false;
 	const daemon = new DaemonClient({
 		url: config.daemonUrl,
 		tokenFile: config.tokenFile,
+		log,
 		onMessage: (message) => void bridge?.handleDaemon(message),
 		onConnection: (connected) => {
 			log(connected ? "connected to Gentle Dot" : "disconnected from Gentle Dot, retrying");

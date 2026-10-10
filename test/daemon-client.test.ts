@@ -53,7 +53,7 @@ afterEach(async () => {
 	cleanup = [];
 });
 
-async function setup(options: { delay?: (attempt: number) => number } = {}) {
+async function setup(options: { delay?: (attempt: number) => number; log?: (line: string) => void } = {}) {
 	const daemon = await fakeDaemon();
 	const file = tokenFile("key-1");
 	const received: ServerMessage[] = [];
@@ -64,6 +64,7 @@ async function setup(options: { delay?: (attempt: number) => number } = {}) {
 		onMessage: (message) => received.push(message),
 		onFatal: (reason) => fatal.push(reason),
 		delay: options.delay ?? (() => 10),
+		log: options.log,
 	});
 	cleanup.push(() => daemon.close(), () => client.stop());
 	return { daemon, file, received, fatal, client };
@@ -222,7 +223,8 @@ describe("DaemonClient backoff and key file", () => {
 	});
 
 	it("keeps retrying when the key file is briefly missing after a connection", async () => {
-		const { daemon, client, file, fatal } = await setup();
+		const logs: string[] = [];
+		const { daemon, client, file, fatal } = await setup({ log: (line) => logs.push(line) });
 		let next = daemon.nextSocket();
 		client.start();
 		const first = await next;
@@ -237,6 +239,7 @@ describe("DaemonClient backoff and key file", () => {
 		await until(() => daemon.frames.length === 2);
 		expect(daemon.frames[1]).toEqual({ type: "hello", token: "key-3", protocol: 1 });
 		expect(fatal).toEqual([]);
+		expect(logs.some((line) => line.includes("access key"))).toBe(true);
 	});
 });
 

@@ -9,6 +9,12 @@ const DRAFT_REFRESH_MS = 20_000;
 
 const BUSY_STATES: AgentState[] = ["thinking", "working", "needs_you"];
 
+/** Daemon errors that refuse a `send` (gentle-dot `bridge.ts` run/dispatch); others leave the turn open. */
+const SEND_REFUSALS = new Set(["no_account", "agent_unavailable", "command_failed", "unsupported"]);
+
+/** Telegram allows 100 inline buttons; one is Cancel. */
+const MAX_CHOICES = 99;
+
 const UNREACHABLE = "Gentle Dot is not reachable right now. Is it running?";
 
 const HELP = [
@@ -159,7 +165,7 @@ export class Bridge {
 					return;
 				}
 				await this.reply(chatId, `🎙️ ${text}`);
-				await this.sendToAssistant(chatId, text);
+				await this.onText(chatId, text);
 				return;
 			}
 			case "voice_unavailable": {
@@ -196,8 +202,8 @@ export class Bridge {
 				return;
 			case "error":
 				if (!turn) return;
-				// While the assistant is not running, an error means the message never started a run.
-				if (!BUSY_STATES.includes(this.agentState)) this.endTurn();
+				// The daemon refused the message itself, so no run will end this turn.
+				if (SEND_REFUSALS.has(message.code) && !BUSY_STATES.includes(this.agentState)) this.endTurn();
 				await this.reply(turn.chatId, `⚠️ ${message.message}`);
 				return;
 			case "ask":
@@ -218,10 +224,10 @@ export class Bridge {
 		this.asks.clear();
 		this.awaitingInput = undefined;
 		this.transcriptions.clear();
-		for (const pending of stale) await this.removeButtons(pending);
 		const turn = this.turn;
-		if (!turn) return;
 		this.endTurn();
+		for (const pending of stale) await this.removeButtons(pending);
+		if (!turn) return;
 		await this.reply(
 			turn.chatId,
 			"Lost the connection to Gentle Dot. It will reconnect on its own; send your message again then.",
@@ -305,27 +311,53 @@ export class Bridge {
 			);
 			return;
 		}
+		const options = ask.options ?? [];
+		if (!Array.isArray(options) || !options.every((option) => typeof option === "string")) {
+			throw new Error("malformed ask options");
+		}
+		if (options.length > MAX_CHOICES) {
+			await this.reply(
+				chatId,
+				fitMessage(head, "\n\nToo many choices for Telegram; answer it in the Gentle Dot app or web page."),
+			);
+			return;
+		}
 		const key = this.nextAskKey++;
 		const pending: PendingAsk = { ask, chatId };
-		this.asks.set(key, pending);
 		if (ask.method === "input" || ask.method === "editor") {
-			if (this.awaitingInput !== undefined) this.asks.delete(this.awaitingInput);
-			this.awaitingInput = key;
-			await this.reply(chatId, fitMessage(head, "\n\nReply with your answer, or /cancel."));
+			const replaced = this.awaitingInput === undefined ? undefined : this.asks.get(this.awaitingInput);
+			if (this.awaitingInput !== undefined) this.forgetAsk(this.awaitingInput);
+			if (replaced) {
+				this.options.daemon.send({ type: "ui_response", requestId: replaced.ask.requestId, cancelled: true });
+			}
+			if (await this.show(chatId, fitMessage(head, "\n\nReply with your answer, or /cancel."))) {
+				this.asks.set(key, pending);
+				this.awaitingInput = key;
+			}
 			return;
 		}
 		const keyboard = new InlineKeyboard();
 		if (ask.method === "confirm") {
 			keyboard.text("Allow", `a:${key}:y`).text("Decline", `a:${key}:n`);
 		} else {
-			(ask.options ?? []).forEach((option, index) => keyboard.text(option, `a:${key}:${index}`).row());
+			options.forEach((option, index) => keyboard.text(option, `a:${key}:${index}`).row());
 			keyboard.text("Cancel", `a:${key}:c`);
 		}
+		// Registered only once shown, so a question Telegram refused is shown when the daemon sends it again.
+		const messageId = await this.show(chatId, fitMessage(head, ""), keyboard);
+		if (messageId === undefined) return;
+		pending.messageId = messageId;
+		this.asks.set(key, pending);
+	}
+
+	/** Sends a question; its message id, or undefined when Telegram refused it. */
+	private async show(chatId: number, text: string, keyboard?: InlineKeyboard): Promise<number | undefined> {
 		try {
-			const sent = await this.bot.api.sendMessage(chatId, fitMessage(head, ""), { reply_markup: keyboard });
-			pending.messageId = sent.message_id;
+			const sent = await this.bot.api.sendMessage(chatId, text, keyboard ? { reply_markup: keyboard } : {});
+			return sent.message_id;
 		} catch (error) {
 			this.options.log(`showing a question failed: ${(error as Error).message}`);
+			return undefined;
 		}
 	}
 

@@ -135,3 +135,75 @@ describe("telegramDownloader", () => {
 		await expect(download("voice/file.oga")).rejects.toThrow(/^HTTP 404$/);
 	});
 });
+
+describe("second verification round", () => {
+	it("keeps the turn when an unrelated error arrives before the run starts", async () => {
+		const h = harness();
+		await h.daemonSays({ type: "ready", agentState: "idle" });
+		await h.text("hi");
+		await h.daemonSays({ type: "error", code: "ask_not_found", message: "That question is no longer open." });
+		await h.daemonSays({ type: "agent_state", state: "thinking" });
+		await h.daemonSays({ type: "message_done", messageId: "m1", text: "Hello." });
+		expect(texts(h)).toEqual(["⚠️ That question is no longer open.", "Hello."]);
+	});
+
+	it("ends the turn before touching Telegram when the connection is lost", async () => {
+		const h = harness();
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "confirm", title: "Allow?" } });
+		await h.text("hi");
+		const lost = h.bridge.connectionLost();
+		await h.text("again");
+		await lost;
+		await h.daemonSays({ type: "message_done", messageId: "m2", text: "Answer to again." });
+		expect(texts(h)).toContain("Answer to again.");
+	});
+
+	it("cancels an earlier input question when a new one replaces it", async () => {
+		const h = harness();
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "input", title: "First?" } });
+		await h.daemonSays({ type: "ask", ask: { requestId: "r2", method: "input", title: "Second?" } });
+		await h.text("answer");
+		expect(h.sent).toEqual([
+			{ type: "ui_response", requestId: "r1", cancelled: true },
+			{ type: "ui_response", requestId: "r2", value: "answer" },
+		]);
+	});
+
+	it("sends a question with too many choices to the app instead of leaving it unseen", async () => {
+		const h = harness();
+		const options = Array.from({ length: 120 }, (_, i) => `Option ${i}`);
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "select", title: "Pick one", options } });
+		const [message] = h.of("sendMessage");
+		expect(message?.payload.text).toBe("Pick one\n\nToo many choices for Telegram; answer it in the Gentle Dot app or web page.");
+		expect(message?.payload.reply_markup).toBeUndefined();
+	});
+
+	it("does not keep a question whose options are malformed", async () => {
+		const h = harness();
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "select", title: "Pick", options: "nope" } } as never);
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "confirm", title: "Allow?" } });
+		expect(h.of("sendMessage").map((c) => c.payload.text)).toEqual(["Allow?"]);
+	});
+
+	it("does not forget a question when Telegram refuses to show it", async () => {
+		const h = harness();
+		h.failing.add("sendMessage");
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "confirm", title: "Allow?" } });
+		h.failing.delete("sendMessage");
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "confirm", title: "Allow?" } });
+		expect(h.of("sendMessage")).toHaveLength(2);
+	});
+
+	it("treats a transcript like typed text: commands are not forwarded and it can answer a question", async () => {
+		const h = harness({ download: async () => Buffer.from("ogg") });
+		await h.daemonSays({ type: "ready", agentState: "idle", voice: { transcribe: true, speak: false } });
+		await h.voice();
+		const first = (h.sent[0] as { requestId: string }).requestId;
+		await h.daemonSays({ type: "voice_transcript", requestId: first, text: "/login" });
+		await h.daemonSays({ type: "ask", ask: { requestId: "r1", method: "input", title: "Name?" } });
+		await h.voice();
+		const second = (h.sent[1] as { requestId: string }).requestId;
+		await h.daemonSays({ type: "voice_transcript", requestId: second, text: "Weekly notes" });
+		expect(h.sent.slice(2)).toEqual([{ type: "ui_response", requestId: "r1", value: "Weekly notes" }]);
+	});
+});

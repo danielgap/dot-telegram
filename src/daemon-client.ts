@@ -12,6 +12,7 @@ export interface DaemonClientOptions {
 	onFatal(reason: string): void;
 	/** Connected after `hello`, or disconnected. */
 	onConnection?(connected: boolean): void;
+	log?(message: string): void;
 	/** Milliseconds to wait before reconnect attempt `attempt` (1-based). */
 	delay?(attempt: number): number;
 }
@@ -64,8 +65,10 @@ export class DaemonClient {
 		try {
 			token = readFileSync(this.options.tokenFile, "utf8").trim();
 		} catch {
-			if (this.answered) this.retry();
-			else this.fatal(`Cannot read the Gentle Dot access key at ${this.options.tokenFile}. Is Gentle Dot installed?`);
+			if (this.answered) {
+				this.options.log?.(`the access key at ${this.options.tokenFile} is missing; retrying`);
+				this.retry();
+			} else this.fatal(`Cannot read the Gentle Dot access key at ${this.options.tokenFile}. Is Gentle Dot installed?`);
 			return;
 		}
 		const socket = new WebSocket(this.options.url);

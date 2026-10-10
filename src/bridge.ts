@@ -1,5 +1,5 @@
-import type { Bot, Context } from "grammy";
-import type { AgentState, ClientMessage, ServerMessage } from "./protocol.ts";
+import { type Bot, type Context, InlineKeyboard } from "grammy";
+import type { AgentState, Ask, ClientMessage, ServerMessage } from "./protocol.ts";
 
 /** Telegram's longest text message. */
 export const TELEGRAM_TEXT_LIMIT = 4096;
@@ -8,6 +8,8 @@ export const TELEGRAM_TEXT_LIMIT = 4096;
 const DRAFT_REFRESH_MS = 20_000;
 
 const BUSY_STATES: AgentState[] = ["thinking", "working", "needs_you"];
+
+const UNREACHABLE = "Gentle Dot is not reachable right now. Is it running?";
 
 const HELP = [
 	"I relay this chat to your Gentle Dot assistant.",
@@ -43,6 +45,14 @@ export function splitMessage(text: string, limit = TELEGRAM_TEXT_LIMIT): string[
 	return chunks;
 }
 
+/** An ask shown in Telegram and not answered yet. */
+interface PendingAsk {
+	ask: Ask;
+	chatId: number;
+	/** The message carrying its buttons, when it has any. */
+	messageId?: number;
+}
+
 interface Turn {
 	chatId: number;
 	draftId: number;
@@ -59,6 +69,11 @@ export class Bridge {
 	/** Where daemon events go: the allowed chat that wrote last. */
 	private chatId: number;
 	private turn: Turn | undefined;
+	/** Asks by a short key, since Telegram's callback data holds at most 64 bytes. */
+	private readonly asks = new Map<number, PendingAsk>();
+	private nextAskKey = 1;
+	/** The input or editor ask the next text message answers. */
+	private awaitingInput: number | undefined;
 
 	constructor(options: BridgeOptions) {
 		this.options = options;
@@ -67,6 +82,10 @@ export class Bridge {
 		this.bot.use((ctx, next) => (this.allowed(ctx) ? next() : undefined));
 		this.bot.command(["start", "help"], (ctx) => this.reply(ctx.chat.id, HELP));
 		this.bot.command("stop", (ctx) => this.stop(ctx.chat.id));
+		this.bot.command("cancel", (ctx) => this.cancelInput(ctx.chat.id));
+		this.bot.callbackQuery(/^a:(\d+):(y|n|c|\d+)$/, (ctx) =>
+			this.onButton(ctx, Number(ctx.match[1]), String(ctx.match[2])),
+		);
 		this.bot.on("message:text", (ctx) => this.onText(ctx.chat.id, ctx.message.text));
 		this.bot.on("stopped_message_generation", (ctx) => {
 			const stopped = ctx.update.stopped_message_generation;
@@ -104,6 +123,12 @@ export class Bridge {
 			case "error":
 				if (turn) await this.reply(turn.chatId, `⚠️ ${message.message}`);
 				return;
+			case "ask":
+				await this.showAsk(message.ask);
+				return;
+			case "ask_resolved":
+				await this.resolveAsk(message.requestId);
+				return;
 			default:
 				return;
 		}
@@ -133,12 +158,131 @@ export class Bridge {
 			await this.reply(chatId, "That command is not supported here.");
 			return;
 		}
+		const key = this.awaitingInput;
+		const pending = key === undefined ? undefined : this.asks.get(key);
+		if (key !== undefined && pending) {
+			if (!this.options.daemon.send({ type: "ui_response", requestId: pending.ask.requestId, value: text })) {
+				await this.reply(chatId, UNREACHABLE);
+				return;
+			}
+			this.forgetAsk(key);
+			return;
+		}
 		await this.sendToAssistant(chatId, text);
+	}
+
+	private async showAsk(ask: Ask): Promise<void> {
+		const chatId = this.turn?.chatId ?? this.chatId;
+		const head = ask.message ? `${ask.title}\n\n${ask.message}` : ask.title;
+		if (ask.method === "app") {
+			await this.reply(chatId, `${head}\n\nApprove this in the Gentle Dot desktop app.`);
+			return;
+		}
+		if (ask.method === "pin") {
+			await this.reply(
+				chatId,
+				`${head}\n\nPIN approvals are not supported from Telegram. Use the Gentle Dot web page.`,
+			);
+			return;
+		}
+		const key = this.nextAskKey++;
+		const pending: PendingAsk = { ask, chatId };
+		this.asks.set(key, pending);
+		if (ask.method === "input" || ask.method === "editor") {
+			if (this.awaitingInput !== undefined) this.asks.delete(this.awaitingInput);
+			this.awaitingInput = key;
+			await this.reply(chatId, `${head}\n\nReply with your answer, or /cancel.`);
+			return;
+		}
+		const keyboard = new InlineKeyboard();
+		if (ask.method === "confirm") {
+			keyboard.text("Allow", `a:${key}:y`).text("Decline", `a:${key}:n`);
+		} else {
+			(ask.options ?? []).forEach((option, index) => keyboard.text(option, `a:${key}:${index}`).row());
+			keyboard.text("Cancel", `a:${key}:c`);
+		}
+		try {
+			const sent = await this.bot.api.sendMessage(chatId, head, { reply_markup: keyboard });
+			pending.messageId = sent.message_id;
+		} catch (error) {
+			this.options.log(`showing a question failed: ${(error as Error).message}`);
+		}
+	}
+
+	private async onButton(ctx: Context, key: number, choice: string): Promise<void> {
+		const pending = this.asks.get(key);
+		if (!pending) {
+			await this.answerButton(ctx, "This request is no longer pending.");
+			return;
+		}
+		const { requestId, options } = pending.ask;
+		let answer: ClientMessage;
+		if (choice === "y" || choice === "n") answer = { type: "ui_response", requestId, confirmed: choice === "y" };
+		else if (choice === "c") answer = { type: "ui_response", requestId, cancelled: true };
+		else {
+			const value = options?.[Number(choice)];
+			if (value === undefined) {
+				await this.answerButton(ctx, "This request is no longer pending.");
+				return;
+			}
+			answer = { type: "ui_response", requestId, value };
+		}
+		if (!this.options.daemon.send(answer)) {
+			await this.answerButton(ctx, UNREACHABLE);
+			return;
+		}
+		await this.answerButton(ctx);
+		await this.removeButtons(pending);
+		this.forgetAsk(key);
+	}
+
+	private async cancelInput(chatId: number): Promise<void> {
+		const key = this.awaitingInput;
+		const pending = key === undefined ? undefined : this.asks.get(key);
+		if (key === undefined || !pending) {
+			await this.reply(chatId, "Nothing to cancel.");
+			return;
+		}
+		if (!this.options.daemon.send({ type: "ui_response", requestId: pending.ask.requestId, cancelled: true })) {
+			await this.reply(chatId, UNREACHABLE);
+			return;
+		}
+		this.forgetAsk(key);
+	}
+
+	private async resolveAsk(requestId: string): Promise<void> {
+		for (const [key, pending] of this.asks) {
+			if (pending.ask.requestId !== requestId) continue;
+			this.forgetAsk(key);
+			await this.removeButtons(pending);
+		}
+	}
+
+	private forgetAsk(key: number): void {
+		this.asks.delete(key);
+		if (this.awaitingInput === key) this.awaitingInput = undefined;
+	}
+
+	private async removeButtons(pending: PendingAsk): Promise<void> {
+		if (pending.messageId === undefined) return;
+		try {
+			await this.bot.api.editMessageReplyMarkup(pending.chatId, pending.messageId);
+		} catch (error) {
+			this.options.log(`removing buttons failed: ${(error as Error).message}`);
+		}
+	}
+
+	private async answerButton(ctx: Context, text?: string): Promise<void> {
+		try {
+			await ctx.answerCallbackQuery(text === undefined ? undefined : { text });
+		} catch (error) {
+			this.options.log(`answering a button failed: ${(error as Error).message}`);
+		}
 	}
 
 	private async sendToAssistant(chatId: number, text: string): Promise<void> {
 		if (!this.options.daemon.send({ type: "send", text })) {
-			await this.reply(chatId, "Gentle Dot is not reachable right now. Is it running?");
+			await this.reply(chatId, UNREACHABLE);
 			return;
 		}
 		if (this.turn) return;
@@ -155,7 +299,7 @@ export class Bridge {
 
 	private async stop(chatId: number): Promise<void> {
 		if (!this.options.daemon.send({ type: "abort" })) {
-			await this.reply(chatId, "Gentle Dot is not reachable right now. Is it running?");
+			await this.reply(chatId, UNREACHABLE);
 		}
 	}
 

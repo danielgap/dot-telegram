@@ -1,5 +1,5 @@
 import { type Bot, type Context, InlineKeyboard } from "grammy";
-import type { AgentState, Ask, ClientMessage, ServerMessage } from "./protocol.ts";
+import { type AgentState, type Ask, type ClientMessage, MAX_VOICE_AUDIO, type ServerMessage } from "./protocol.ts";
 
 /** Telegram's longest text message. */
 export const TELEGRAM_TEXT_LIMIT = 4096;
@@ -29,6 +29,22 @@ export interface BridgeOptions {
 	allowedUsers: Set<number>;
 	log(message: string): void;
 	draftRefreshMs?: number;
+	/** Downloads a Telegram file by its `file_path`; the default uses the Bot API file endpoint. */
+	download?(filePath: string): Promise<Buffer>;
+}
+
+/** Downloads from the Bot API file endpoint; errors never carry the address, which holds the token. */
+export function telegramDownloader(botToken: string): (filePath: string) => Promise<Buffer> {
+	return async (filePath) => {
+		let response: Response;
+		try {
+			response = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
+		} catch {
+			throw new Error("network error");
+		}
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		return Buffer.from(await response.arrayBuffer());
+	};
 }
 
 /** Splits text into chunks of at most `limit` characters, at a line break when one is close. */
@@ -74,6 +90,11 @@ export class Bridge {
 	private nextAskKey = 1;
 	/** The input or editor ask the next text message answers. */
 	private awaitingInput: number | undefined;
+	/** The daemon can transcribe voice notes (it has an OpenAI API key). */
+	private canTranscribe = false;
+	/** Transcriptions this bridge asked for, by request id, with the chat they came from. */
+	private readonly transcriptions = new Map<string, number>();
+	private nextVoiceId = 1;
 
 	constructor(options: BridgeOptions) {
 		this.options = options;
@@ -87,6 +108,7 @@ export class Bridge {
 			this.onButton(ctx, Number(ctx.match[1]), String(ctx.match[2])),
 		);
 		this.bot.on("message:text", (ctx) => this.onText(ctx.chat.id, ctx.message.text));
+		this.bot.on("message:voice", (ctx) => this.onVoice(ctx.chat.id, ctx.message.voice.file_id));
 		this.bot.on("stopped_message_generation", (ctx) => {
 			const stopped = ctx.update.stopped_message_generation;
 			if (stopped && this.turn?.draftId === stopped.draft_id) this.options.daemon.send({ type: "abort" });
@@ -98,6 +120,27 @@ export class Bridge {
 	async handleDaemon(message: ServerMessage): Promise<void> {
 		const turn = this.turn;
 		switch (message.type) {
+			case "ready":
+			case "auth_providers":
+				if (message.voice) this.canTranscribe = message.voice.transcribe;
+				return;
+			case "voice_transcript": {
+				const chatId = this.takeTranscription(message.requestId);
+				if (chatId === undefined) return;
+				const text = message.text.trim();
+				if (text === "") {
+					await this.reply(chatId, "I could not hear anything in that voice note.");
+					return;
+				}
+				await this.reply(chatId, `🎙️ ${text}`);
+				await this.sendToAssistant(chatId, text);
+				return;
+			}
+			case "voice_unavailable": {
+				const chatId = this.takeTranscription(message.requestId);
+				if (chatId !== undefined) await this.reply(chatId, message.reason);
+				return;
+			}
 			case "agent_state":
 				if (!turn) return;
 				if (BUSY_STATES.includes(message.state)) {
@@ -169,6 +212,41 @@ export class Bridge {
 			return;
 		}
 		await this.sendToAssistant(chatId, text);
+	}
+
+	private async onVoice(chatId: number, fileId: string): Promise<void> {
+		if (!this.canTranscribe) {
+			await this.reply(chatId, "Voice notes need an OpenAI API key connected in Gentle Dot.");
+			return;
+		}
+		let audio: Buffer;
+		try {
+			const file = await this.bot.api.getFile(fileId);
+			if (!file.file_path) throw new Error("no file path");
+			const download = this.options.download ?? telegramDownloader(this.bot.token);
+			audio = await download(file.file_path);
+		} catch (error) {
+			this.options.log(`voice download failed: ${(error as Error).message}`);
+			await this.reply(chatId, "I could not download that voice note. Try again.");
+			return;
+		}
+		const data = audio.toString("base64");
+		if (data.length > MAX_VOICE_AUDIO) {
+			await this.reply(chatId, "That voice note is too long; keep it under about a minute.");
+			return;
+		}
+		const requestId = `telegram-voice-${this.nextVoiceId++}`;
+		if (!this.options.daemon.send({ type: "voice_transcribe", requestId, mime: "audio/ogg", data })) {
+			await this.reply(chatId, UNREACHABLE);
+			return;
+		}
+		this.transcriptions.set(requestId, chatId);
+	}
+
+	private takeTranscription(requestId: string): number | undefined {
+		const chatId = this.transcriptions.get(requestId);
+		this.transcriptions.delete(requestId);
+		return chatId;
 	}
 
 	private async showAsk(ask: Ask): Promise<void> {

@@ -79,8 +79,18 @@ export function harness(options: Partial<BridgeOptions> = {}) {
 					: {}),
 			},
 		});
+	const voice = (from = OWNER) =>
+		update({
+			message: {
+				message_id: ++updateId,
+				date: 0,
+				chat: { id: from, type: "private", first_name: "U" },
+				from: { id: from, is_bot: false, first_name: "U" },
+				voice: { file_id: "voice-1", file_unique_id: "u1", duration: 3, mime_type: "audio/ogg" },
+			},
+		});
 	const daemonSays = (payload: ServerPayload) => bridge.handleDaemon({ ...payload, seq: 0 });
 	const of = (method: string) => calls.filter((call) => call.method === method);
 	const settle = () => new Promise((resolve) => setImmediate(resolve));
-	return { bot, bridge, calls, sent, daemon, update, text, daemonSays, of, failing, settle };
+	return { bot, bridge, calls, sent, daemon, update, text, voice, daemonSays, of, failing, settle };
 }

@@ -1,0 +1,56 @@
+import { homedir } from "node:os";
+import { Bot } from "grammy";
+import { Bridge } from "./bridge.ts";
+import { ConfigError, loadConfig } from "./config.ts";
+import { DaemonClient } from "./daemon-client.ts";
+
+const log = (message: string) => console.error(`[dot-telegram] ${message}`);
+
+function main(): void {
+	let config: ReturnType<typeof loadConfig>;
+	try {
+		config = loadConfig(process.env, homedir());
+	} catch (error) {
+		if (!(error instanceof ConfigError)) throw error;
+		log(error.message);
+		process.exit(1);
+	}
+
+	const bot = new Bot(config.botToken);
+	let bridge: Bridge | undefined;
+	const daemon = new DaemonClient({
+		url: config.daemonUrl,
+		tokenFile: config.tokenFile,
+		onMessage: (message) => void bridge?.handleDaemon(message),
+		onConnection: (connected) => {
+			log(connected ? "connected to Gentle Dot" : "disconnected from Gentle Dot, retrying");
+			if (!connected) void bridge?.connectionLost();
+		},
+		onFatal: (reason) => {
+			log(reason);
+			void bot.stop().finally(() => process.exit(1));
+		},
+	});
+	bridge = new Bridge({ bot, daemon, allowedUsers: config.allowedUsers, log });
+
+	const shutdown = () => {
+		daemon.stop();
+		void bot.stop().finally(() => process.exit(0));
+	};
+	process.once("SIGINT", shutdown);
+	process.once("SIGTERM", shutdown);
+
+	daemon.start();
+	void bot
+		.start({
+			allowed_updates: ["message", "callback_query", "stopped_message_generation"],
+			onStart: (info) => log(`listening as @${info.username}`),
+		})
+		.catch((error: Error) => {
+			log(`Telegram polling stopped: ${error.message}`);
+			daemon.stop();
+			process.exit(1);
+		});
+}
+
+main();

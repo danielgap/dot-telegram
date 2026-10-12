@@ -1,5 +1,14 @@
 import { type Bot, type Context, InlineKeyboard } from "grammy";
-import { type AgentState, type Ask, type ClientMessage, MAX_VOICE_AUDIO, type ServerMessage } from "./protocol.ts";
+import {
+	type AgentState,
+	type Ask,
+	type AttachmentRef,
+	type ClientMessage,
+	MAX_VOICE_AUDIO,
+	type ServerMessage,
+	type UploadedFile,
+} from "./protocol.ts";
+import { UploadRefused } from "./uploads.ts";
 
 /** Telegram's longest text message. */
 export const TELEGRAM_TEXT_LIMIT = 4096;
@@ -12,6 +21,9 @@ const BUSY_STATES: AgentState[] = ["thinking", "working", "needs_you"];
 /** Daemon errors that refuse a `send` (gentle-dot `bridge.ts` run/dispatch); others leave the turn open. */
 const SEND_REFUSALS = new Set(["no_account", "agent_unavailable", "command_failed", "unsupported"]);
 
+/** The largest file the Bot API lets a bot download. */
+export const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
+
 /** Telegram allows 100 inline buttons; one is Cancel. */
 const MAX_CHOICES = 99;
 
@@ -21,6 +33,7 @@ const HELP = [
 	"I relay this chat to your Gentle Dot assistant.",
 	"",
 	"Write a message to talk to it. /stop stops what it is doing; the stop button on its live status does the same.",
+	"Send it a file, photo, video or audio (up to 20 MB); the caption goes with it as your message.",
 	"Actions that send or change something in your accounts are approved in the Gentle Dot desktop app.",
 ].join("\n");
 
@@ -37,7 +50,33 @@ export interface BridgeOptions {
 	draftRefreshMs?: number;
 	/** Downloads a Telegram file by its `file_path`; the default uses the Bot API file endpoint. */
 	download?(filePath: string): Promise<Buffer>;
+	/** Uploads a file to the daemon (`POST /upload`); without it, files are refused. */
+	upload?(file: Upload): Promise<UploadedFile>;
 }
+
+/** A file on its way to the daemon. */
+export interface Upload {
+	name: string;
+	data: Buffer;
+	uploadId?: string;
+}
+
+/** A file in a Telegram message, as the bridge passes it on. */
+interface IncomingFile {
+	fileId: string;
+	name: string;
+	size?: number;
+}
+
+/** Extensions for audio sent without a file name, by MIME type. */
+const AUDIO_EXTENSIONS: Record<string, string> = {
+	"audio/mpeg": "mp3",
+	"audio/mp4": "m4a",
+	"audio/ogg": "ogg",
+	"audio/wav": "wav",
+	"audio/x-wav": "wav",
+	"audio/flac": "flac",
+};
 
 /**
  * Downloads from the Bot API file endpoint, giving up after `timeoutMs` (updates are handled one at a
@@ -130,6 +169,29 @@ export class Bridge {
 		);
 		this.bot.on("message:text", (ctx) => this.onText(ctx.chat.id, ctx.message.text));
 		this.bot.on("message:voice", (ctx) => this.onVoice(ctx.chat.id, ctx.message.voice.file_id));
+		this.bot.on("message:document", (ctx) => {
+			const { document } = ctx.message;
+			const name = document.file_name || `file-${document.file_unique_id}`;
+			return this.onFile(ctx.chat.id, { fileId: document.file_id, name, size: document.file_size }, ctx.message.caption);
+		});
+		this.bot.on("message:photo", (ctx) => {
+			// Telegram sends every size, smallest first; the largest one is the photo.
+			const photo = ctx.message.photo.at(-1);
+			if (!photo) return;
+			const name = `photo-${photo.file_unique_id}.jpg`;
+			return this.onFile(ctx.chat.id, { fileId: photo.file_id, name, size: photo.file_size }, ctx.message.caption);
+		});
+		this.bot.on("message:video", (ctx) => {
+			const { video } = ctx.message;
+			const name = video.file_name || `video-${video.file_unique_id}.mp4`;
+			return this.onFile(ctx.chat.id, { fileId: video.file_id, name, size: video.file_size }, ctx.message.caption);
+		});
+		this.bot.on("message:audio", (ctx) => {
+			const { audio } = ctx.message;
+			const extension = AUDIO_EXTENSIONS[audio.mime_type ?? ""] ?? "audio";
+			const name = audio.file_name || `audio-${audio.file_unique_id}.${extension}`;
+			return this.onFile(ctx.chat.id, { fileId: audio.file_id, name, size: audio.file_size }, ctx.message.caption);
+		});
 		this.bot.on("stopped_message_generation", (ctx) => {
 			const stopped = ctx.update.stopped_message_generation;
 			if (stopped && this.turn?.draftId === stopped.draft_id) this.options.daemon.send({ type: "abort" });
@@ -289,6 +351,47 @@ export class Bridge {
 		this.transcriptions.set(requestId, chatId);
 	}
 
+	/** Downloads a file from Telegram, uploads it to the daemon and sends it with its caption. */
+	private async onFile(chatId: number, file: IncomingFile, caption = ""): Promise<void> {
+		const upload = this.options.upload;
+		if (!upload) {
+			await this.reply(chatId, "Files are not supported here.");
+			return;
+		}
+		if (this.awaitingInput !== undefined && this.asks.has(this.awaitingInput)) {
+			await this.reply(chatId, "Answer the question with a text message, or /cancel.");
+			return;
+		}
+		if (file.size !== undefined && file.size > TELEGRAM_DOWNLOAD_LIMIT) {
+			await this.reply(chatId, "That file is too big: Telegram lets bots download files up to 20 MB.");
+			return;
+		}
+		let data: Buffer;
+		try {
+			const remote = await this.bot.api.getFile(file.fileId);
+			if (!remote.file_path) throw new Error("no file path");
+			const download = this.options.download ?? telegramDownloader(this.bot.token, { timeoutMs: 120_000 });
+			data = await download(remote.file_path);
+		} catch (error) {
+			this.options.log(`file download failed: ${(error as Error).message}`);
+			await this.reply(chatId, "I could not download that file. Try again.");
+			return;
+		}
+		let stored: UploadedFile;
+		try {
+			stored = await upload({ name: file.name, data });
+		} catch (error) {
+			if (error instanceof UploadRefused) {
+				await this.reply(chatId, `⚠️ ${error.message}`);
+				return;
+			}
+			this.options.log(`file upload failed: ${(error as Error).message}`);
+			await this.reply(chatId, UNREACHABLE);
+			return;
+		}
+		await this.sendToAssistant(chatId, caption, [{ uploadId: stored.uploadId, name: stored.name }]);
+	}
+
 	private takeTranscription(requestId: string): number | undefined {
 		const chatId = this.transcriptions.get(requestId);
 		this.transcriptions.delete(requestId);
@@ -432,8 +535,8 @@ export class Bridge {
 		}
 	}
 
-	private async sendToAssistant(chatId: number, text: string): Promise<void> {
-		if (!this.options.daemon.send({ type: "send", text })) {
+	private async sendToAssistant(chatId: number, text: string, attachments?: AttachmentRef[]): Promise<void> {
+		if (!this.options.daemon.send(attachments ? { type: "send", text, attachments } : { type: "send", text })) {
 			await this.reply(chatId, UNREACHABLE);
 			return;
 		}

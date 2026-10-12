@@ -3,6 +3,7 @@ import { Bot } from "grammy";
 import { Bridge } from "./bridge.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import { DaemonClient } from "./daemon-client.ts";
+import { daemonUploader } from "./uploads.ts";
 
 const log = (message: string) => console.error(`[dot-telegram] ${message}`);
 
@@ -37,7 +38,13 @@ function main(): void {
 			void bot.stop().finally(() => process.exit(1));
 		},
 	});
-	bridge = new Bridge({ bot, daemon, allowedUsers: config.allowedUsers, log });
+	bridge = new Bridge({
+		bot,
+		daemon,
+		allowedUsers: config.allowedUsers,
+		log,
+		upload: daemonUploader({ daemonUrl: config.daemonUrl, tokenFile: config.tokenFile }),
+	});
 
 	const shutdown = () => {
 		daemon.stop();

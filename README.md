@@ -74,6 +74,12 @@ When the assistant asks, you answer from the chat: **Allow** or **Decline**, one
 
 Record a voice note. Gentle Dot transcribes it, the bot shows you what it heard ("🎙️ …"), and sends it on. Transcription uses Gentle Dot's OpenAI API key.
 
+---
+
+### Files
+
+Send a document, photo, video, or audio file. The bot uploads it to Gentle Dot and sends it to the assistant with its caption as your message. Telegram lets bots download files up to 20 MB, so larger files are refused before anything is downloaded.
+
 <div align="right"><a href="#top">Back to top</a></div>
 
 <div align="center"><img src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-dot/main/docs/assets/brand/rose.png" width="28" alt="" /></div>
@@ -86,6 +92,7 @@ Record a voice note. Gentle Dot transcribes it, the bot shows you what it heard 
 | Write while it works | Your message steers the run already going |
 | The stop button, or `/stop` | Stops what the assistant is doing |
 | Send a voice note | Transcribed, shown back as "🎙️ …", then sent |
+| Send a file, photo, video, or audio | Uploaded to Gentle Dot and sent with its caption (up to 20 MB) |
 | A question with choices | Buttons: **Allow** / **Decline**, or one per option plus **Cancel** |
 | A question that needs text | Your next message is the answer; `/cancel` cancels it |
 | An action that sends something (desktop) | "Approve this in the Gentle Dot desktop app." |
@@ -259,6 +266,7 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | `/stop`, the stop button | `abort` |
 | A button, a typed reply, `/cancel` | `ui_response` |
 | A voice note | `voice_transcribe`, then `send` with the transcript |
+| A file, photo, video, or audio | `POST /upload` (HTTP, same address and access key), then `send` with `attachments` |
 | Live status (`sendMessageDraft`) | `agent_state`, `activity` |
 | The answer (`sendMessage`) | `message_done` |
 
@@ -268,13 +276,15 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | [`src/config.ts`](src/config.ts) | Reads and checks the environment |
 | [`src/daemon-client.ts`](src/daemon-client.ts) | The WebSocket connection: `hello`, reconnects, fatal close codes |
 | [`src/bridge.ts`](src/bridge.ts) | Telegram updates to protocol messages and back |
+| [`src/uploads.ts`](src/uploads.ts) | Uploads files to the daemon's `POST /upload` |
 | [`src/protocol.ts`](src/protocol.ts) | The part of Gentle Dot's protocol the bot uses, copied because that package is not published |
 
 ### Limits today
 
 - Answers are sent as plain text, so Markdown shows as typed.
 - One chat at a time: daemon events go to the allowed chat that wrote last.
-- Files only go in, as voice notes. The assistant cannot send you a file yet.
+- Files only go in, up to 20 MB each. The assistant cannot send you a file yet.
+- A photo album arrives as one message per photo, each sent on its own.
 - Live status needs a Telegram app recent enough for Bot API 10.3 drafts.
 
 <div align="right"><a href="#top">Back to top</a></div>

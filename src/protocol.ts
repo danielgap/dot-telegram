@@ -38,12 +38,29 @@ export interface VoiceCapability {
 	speak: boolean;
 }
 
+/** A file uploaded with `POST /upload`, waiting to be sent with a message. */
+export interface AttachmentRef {
+	/** The message folder the daemon gave the first file; later files of the message reuse it. */
+	uploadId: string;
+	/** The name the daemon stored the file under. */
+	name: string;
+}
+
+/** The daemon's answer to `POST /upload`. */
+export interface UploadedFile extends AttachmentRef {
+	size: number;
+	mime: string;
+	/** Where the file is, relative to the assistant's workspace: `uploads/<uploadId>/<name>`. */
+	path: string;
+}
+
 /** Longest base64 recording the daemon accepts in `voice_transcribe`. */
 export const MAX_VOICE_AUDIO = 960_000;
 
 export type ClientMessage =
 	| { type: "hello"; token: string; protocol: number }
-	| { type: "send"; text: string; requestId?: string }
+	/** `text` may be empty when files are attached. */
+	| { type: "send"; text: string; requestId?: string; attachments?: AttachmentRef[] }
 	| { type: "abort" }
 	| { type: "ui_response"; requestId: string; value?: string; confirmed?: boolean; cancelled?: boolean }
 	| { type: "voice_transcribe"; requestId: string; mime: string; data: string };

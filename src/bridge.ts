@@ -1,4 +1,5 @@
 import { type Bot, type Context, InlineKeyboard } from "grammy";
+import { ModelPicker } from "./models.ts";
 import {
 	type AgentState,
 	type Ask,
@@ -33,6 +34,7 @@ const HELP = [
 	"I relay this chat to your Gentle Dot assistant.",
 	"",
 	"Write a message to talk to it. /stop stops what it is doing; the stop button on its live status does the same.",
+	"/model shows the current LLM and lets you choose another. The choice is shared with Gentle Dot web and saved as the default; during a reply it waits until that reply finishes.",
 	"Send it a file, photo, video or audio (up to 20 MB); the caption goes with it as your message.",
 	"Actions that send or change something in your accounts are approved in the Gentle Dot desktop app.",
 ].join("\n");
@@ -141,6 +143,7 @@ interface Turn {
 export class Bridge {
 	private readonly options: BridgeOptions;
 	private readonly bot: Bot;
+	private readonly models: ModelPicker;
 	/** Where daemon events go: the allowed chat that wrote last. */
 	private chatId: number;
 	private turn: Turn | undefined;
@@ -159,11 +162,14 @@ export class Bridge {
 	constructor(options: BridgeOptions) {
 		this.options = options;
 		this.bot = options.bot;
+		this.models = new ModelPicker(this.bot, (message) => options.daemon.send(message), options.log);
 		this.chatId = [...options.allowedUsers][0] ?? 0;
 		this.bot.use((ctx, next) => (this.allowed(ctx) ? next() : undefined));
 		this.bot.command(["start", "help"], (ctx) => this.reply(ctx.chat.id, HELP));
 		this.bot.command("stop", (ctx) => this.stop(ctx.chat.id));
 		this.bot.command("cancel", (ctx) => this.cancelInput(ctx.chat.id));
+		this.bot.command("model", (ctx) => this.models.open(ctx.chat.id));
+		this.bot.callbackQuery(/^m:/, (ctx) => this.models.button(ctx));
 		this.bot.callbackQuery(/^a:(\d+):(y|n|c|\d+)$/, (ctx) =>
 			this.onButton(ctx, Number(ctx.match[1]), String(ctx.match[2])),
 		);
@@ -215,6 +221,9 @@ export class Bridge {
 				this.agentState = message.agentState;
 				this.canTranscribe = message.voice?.transcribe ?? false;
 				return;
+			case "models":
+				await this.models.receive(message);
+				return;
 			case "auth_providers":
 				if (message.voice) this.canTranscribe = message.voice.transcribe;
 				return;
@@ -263,6 +272,7 @@ export class Bridge {
 				if (turn && message.level !== "info") await this.reply(turn.chatId, `⚠️ ${message.message}`);
 				return;
 			case "error":
+				if (await this.models.error(message.code, message.message, turn !== undefined)) return;
 				if (!turn) return;
 				// The daemon refused the message itself, so no run will end this turn.
 				if (SEND_REFUSALS.has(message.code) && !BUSY_STATES.includes(this.agentState)) this.endTurn();
@@ -288,7 +298,9 @@ export class Bridge {
 		this.transcriptions.clear();
 		const turn = this.turn;
 		this.endTurn();
+		const modelsLost = this.models.connectionLost();
 		for (const pending of stale) await this.removeButtons(pending);
+		await modelsLost;
 		if (!turn) return;
 		await this.reply(
 			turn.chatId,

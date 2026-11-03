@@ -13,7 +13,7 @@
 <img src="https://img.shields.io/badge/status-prototype-F095C8?style=for-the-badge&labelColor=1A1218" alt="Status: prototype">
 <img src="https://img.shields.io/badge/Gentle%20Dot-protocol%20v1-F095C8?style=for-the-badge&labelColor=1A1218" alt="Gentle Dot protocol v1">
 <img src="https://img.shields.io/badge/Bot%20API-10.3-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="Telegram Bot API 10.3">
-<a href="#development"><img src="https://img.shields.io/badge/tests-88%20offline-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="88 offline tests"></a>
+<a href="#development"><img src="https://img.shields.io/badge/tests-121%20offline-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="121 offline tests"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="License: MIT"></a>
 </p>
 
@@ -64,6 +64,26 @@ While the assistant works, Telegram shows a live status, "Thinking…" or what i
 
 ---
 
+### Choose your model
+
+Use `/model` to see the current LLM and choose from the models available to your connected accounts. Buttons are grouped by account and paginated; **Previous**, **Next**, and **Close** navigate without sending a chat message. The bot confirms the daemon's reported state, not merely that a button was pressed.
+
+The choice is **shared with the web and desktop clients** and saved as the default, not isolated to your Telegram chat. A choice made during a reply waits until that reply finishes. Compatible thinking levels carry over; this command does not configure subagent models, profiles, or accounts.
+
+If a request cannot be confirmed within 15 seconds or the connection drops, it is not retried. Use `/model` again to check the actual state. Open menus follow changes made from the web; old buttons expire after a refresh or disconnect. Only one local model request is processed at a time.
+
+#### Try it from Telegram
+
+1. Open your existing private bot chat and send `/help` to check that `/model` is listed.
+2. Send `/model`. Check the **Current model** and, if present, **Pending model**. The active model has a **✓** button.
+3. Choose a model using its button; use **Next** and **Previous** for more options. **Close** dismisses the menu without changing anything.
+4. Wait for **Current model** to confirm the choice, or **Pending model** if the assistant is still replying. Reopen `/model` or the web selector to check the shared state.
+5. Send a normal message to try the chosen model. You can return to the previous model with `/model`.
+
+Changing the model may change provider usage or billing. Merely opening or closing the menu does not change the model.
+
+---
+
 ### Questions, answered with a tap
 
 When the assistant asks, you answer from the chat: **Allow** or **Decline**, one button per choice, or a typed reply. Actions that send or change something in your accounts are never approved from Telegram: you are told where to approve them.
@@ -91,6 +111,7 @@ Send a document, photo, video, or audio file. The bot uploads it to Gentle Dot a
 | Write a message | The assistant gets it; a live status shows its progress |
 | Write while it works | Your message steers the run already going |
 | The stop button, or `/stop` | Stops what the assistant is doing |
+| `/model` | Shows the current/pending model and offers model-selection buttons; shared with the web and saved as the default |
 | Send a voice note | Transcribed, shown back as "🎙️ …", then sent |
 | Send a file, photo, video, or audio | Uploaded to Gentle Dot and sent with its caption (up to 20 MB) |
 | A question with choices | Buttons: **Allow** / **Decline**, or one per option plus **Cancel** |
@@ -211,6 +232,34 @@ journalctl -u dot-telegram -f
 
 To update: `git pull --ff-only && npm ci && sudo systemctl restart dot-telegram`.
 
+### Update an existing Docker deployment
+
+If your installation already provides a `Dockerfile` and `compose.yaml` with the `bridge` service and `dot-telegram:deploy` image, run the following in that directory. Keep its existing `.env`, network, and daemon-volume configuration. The commands replace only the Telegram bridge, not Gentle Dot; a short bot interruption is expected.
+
+Save a rollback image, build only the required application files (never send `.env`, `.git`, or `node_modules` as build context), then recreate the service:
+
+```bash
+set -euo pipefail
+previous=$(docker inspect "$(docker compose ps -q bridge)" --format '{{.Image}}')
+rollback="dot-telegram:rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+docker tag "$previous" "$rollback"
+printf 'Rollback image: %s\n' "$rollback"
+tar -cf - Dockerfile package.json package-lock.json src tsconfig.json \
+  | docker build --tag dot-telegram:deploy -
+docker compose up -d --no-deps --no-build --pull never bridge
+docker compose ps bridge
+docker compose logs --tail=30 bridge
+```
+
+Expect `connected to Gentle Dot` and `listening as @your_bot`, without repeated restarts or polling conflicts. Then follow [Try it from Telegram](#try-it-from-telegram). Startup logs prove connectivity, not a model-selection round trip: perform that final check from your own chat.
+
+If startup fails, restore the image saved in `$rollback` and recreate only the bridge:
+
+```bash
+docker tag "$rollback" dot-telegram:deploy
+docker compose up -d --no-deps --no-build --pull never bridge
+```
+
 <div align="right"><a href="#top">Back to top</a></div>
 
 <div align="center"><img src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-dot/main/docs/assets/brand/rose.png" width="28" alt="" /></div>
@@ -247,6 +296,8 @@ What to keep in mind:
 | Telegram answers `409 Conflict` | Two processes poll with the same token: stop one of them |
 | The bot never answers | You are writing from another account, or from a group: it only answers in private to allowed ids |
 | "Voice notes need an OpenAI API key" | Gentle Dot transcribes with OpenAI: connect an OpenAI API key in Gentle Dot |
+| "No models are available" | Connect an AI account in Gentle Dot web first |
+| "The model request could not be confirmed" | Run `/model` to check the actual state; no automatic retry was sent. If listing never responds, update Gentle Dot to a version supporting `models_list` / `model_set` (present at `535e7f7`) |
 
 <div align="right"><a href="#top">Back to top</a></div>
 
@@ -264,6 +315,7 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | :--- | :--- |
 | A text message | `send` |
 | `/stop`, the stop button | `abort` |
+| `/model`, model-selection buttons | `models_list`, `model_set`; `models` reports current/pending state |
 | A button, a typed reply, `/cancel` | `ui_response` |
 | A voice note | `voice_transcribe`, then `send` with the transcript |
 | A file, photo, video, or audio | `POST /upload` (HTTP, same address and access key), then `send` with `attachments` |
@@ -276,6 +328,7 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | [`src/config.ts`](src/config.ts) | Reads and checks the environment |
 | [`src/daemon-client.ts`](src/daemon-client.ts) | The WebSocket connection: `hello`, reconnects, fatal close codes |
 | [`src/bridge.ts`](src/bridge.ts) | Telegram updates to protocol messages and back |
+| [`src/models.ts`](src/models.ts) | Paginated model menus, daemon-confirmed selection, and reconnect cleanup |
 | [`src/uploads.ts`](src/uploads.ts) | Uploads files to the daemon's `POST /upload` |
 | [`src/protocol.ts`](src/protocol.ts) | The part of Gentle Dot's protocol the bot uses, copied because that package is not published |
 

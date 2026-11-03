@@ -64,6 +64,16 @@ While the assistant works, Telegram shows a live status, "Thinking…" or what i
 
 ---
 
+### Choose your model
+
+Use `/model` to see the current LLM and choose from the models available to your connected accounts. Buttons are grouped by account and paginated; **Previous**, **Next**, and **Close** navigate without sending a chat message. The bot confirms the daemon's reported state, not merely that a button was pressed.
+
+The choice is **shared with the web and desktop clients** and saved as the default, not isolated to your Telegram chat. A choice made during a reply waits until that reply finishes. Compatible thinking levels carry over; this command does not configure subagent models, profiles, or accounts.
+
+If a request cannot be confirmed within 15 seconds or the connection drops, it is not retried. Use `/model` again to check the actual state. Open menus follow changes made from the web; old buttons expire after a refresh or disconnect. Only one local model request is processed at a time.
+
+---
+
 ### Questions, answered with a tap
 
 When the assistant asks, you answer from the chat: **Allow** or **Decline**, one button per choice, or a typed reply. Actions that send or change something in your accounts are never approved from Telegram: you are told where to approve them.
@@ -91,6 +101,7 @@ Send a document, photo, video, or audio file. The bot uploads it to Gentle Dot a
 | Write a message | The assistant gets it; a live status shows its progress |
 | Write while it works | Your message steers the run already going |
 | The stop button, or `/stop` | Stops what the assistant is doing |
+| `/model` | Shows the current/pending model and offers model-selection buttons; shared with the web and saved as the default |
 | Send a voice note | Transcribed, shown back as "🎙️ …", then sent |
 | Send a file, photo, video, or audio | Uploaded to Gentle Dot and sent with its caption (up to 20 MB) |
 | A question with choices | Buttons: **Allow** / **Decline**, or one per option plus **Cancel** |
@@ -247,6 +258,8 @@ What to keep in mind:
 | Telegram answers `409 Conflict` | Two processes poll with the same token: stop one of them |
 | The bot never answers | You are writing from another account, or from a group: it only answers in private to allowed ids |
 | "Voice notes need an OpenAI API key" | Gentle Dot transcribes with OpenAI: connect an OpenAI API key in Gentle Dot |
+| "No models are available" | Connect an AI account in Gentle Dot web first |
+| "The model request could not be confirmed" | Run `/model` to check the actual state; no automatic retry was sent. If listing never responds, update Gentle Dot to a version supporting `models_list` / `model_set` (present at `535e7f7`) |
 
 <div align="right"><a href="#top">Back to top</a></div>
 
@@ -264,6 +277,7 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | :--- | :--- |
 | A text message | `send` |
 | `/stop`, the stop button | `abort` |
+| `/model`, model-selection buttons | `models_list`, `model_set`; `models` reports current/pending state |
 | A button, a typed reply, `/cancel` | `ui_response` |
 | A voice note | `voice_transcribe`, then `send` with the transcript |
 | A file, photo, video, or audio | `POST /upload` (HTTP, same address and access key), then `send` with `attachments` |
@@ -276,6 +290,7 @@ The bot signs in with `hello` and the daemon's access key, then translates in bo
 | [`src/config.ts`](src/config.ts) | Reads and checks the environment |
 | [`src/daemon-client.ts`](src/daemon-client.ts) | The WebSocket connection: `hello`, reconnects, fatal close codes |
 | [`src/bridge.ts`](src/bridge.ts) | Telegram updates to protocol messages and back |
+| [`src/models.ts`](src/models.ts) | Paginated model menus, daemon-confirmed selection, and reconnect cleanup |
 | [`src/uploads.ts`](src/uploads.ts) | Uploads files to the daemon's `POST /upload` |
 | [`src/protocol.ts`](src/protocol.ts) | The part of Gentle Dot's protocol the bot uses, copied because that package is not published |
 

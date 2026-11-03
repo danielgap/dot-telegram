@@ -57,15 +57,43 @@ export interface UploadedFile extends AttachmentRef {
 /** Longest base64 recording the daemon accepts in `voice_transcribe`. */
 export const MAX_VOICE_AUDIO = 960_000;
 
+/** Chat model-picker messages from the same upstream protocol (S32). */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface ModelRef {
+	provider: string;
+	id: string;
+	name: string;
+	thinking?: ThinkingLevel;
+}
+
+export interface ModelChoice {
+	provider: string;
+	id: string;
+	name: string;
+	images: boolean;
+	thinkingLevels?: ThinkingLevel[];
+}
+
+export interface ModelsState {
+	type: "models";
+	current?: ModelRef;
+	next?: ModelRef;
+	groups: { provider: string; name: string; models: ModelChoice[] }[];
+}
+
 export type ClientMessage =
 	| { type: "hello"; token: string; protocol: number }
 	/** `text` may be empty when files are attached. */
 	| { type: "send"; text: string; requestId?: string; attachments?: AttachmentRef[] }
 	| { type: "abort" }
+	| { type: "models_list" }
+	| { type: "model_set"; provider: string; id: string; thinking?: ThinkingLevel }
 	| { type: "ui_response"; requestId: string; value?: string; confirmed?: boolean; cancelled?: boolean }
 	| { type: "voice_transcribe"; requestId: string; mime: string; data: string };
 
 export type ServerPayload =
+	| ModelsState
 	| { type: "ready"; agentState: AgentState; voice?: VoiceCapability }
 	| { type: "agent_state"; state: AgentState }
 	| { type: "message_delta"; messageId: string; delta: string }
